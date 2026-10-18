@@ -8,7 +8,7 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import generate, generate_stream, log, parse_follow_ups, FollowUpStreamFilter
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
@@ -215,13 +215,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
+                follow_filter = FollowUpStreamFilter()
                 for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                    piece = follow_filter.feed(delta)
+                    if not piece:
+                        continue
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                             "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
+                             "model": model_name, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
+                tail, follow_ups = follow_filter.flush()
+                if tail:
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                             "model": model_name, "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                end_delta = {}
+                if follow_ups:
+                    end_delta["follow_ups"] = follow_ups
                 end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                       "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                       "model": model_name, "choices": [{"index": 0, "delta": end_delta, "finish_reason": "stop"}]}
                 self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
@@ -237,12 +249,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
+        text, follow_ups = parse_follow_ups(text)
         tool_calls = None
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
+        if follow_ups:
+            msg["follow_ups"] = follow_ups
         finish = "tool_calls" if tool_calls else "stop"
 
         if stream:
@@ -330,6 +345,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
+        text, follow_ups = parse_follow_ups(text)
         tool_calls = None
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
@@ -372,6 +388,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "created_at": int(time.time()),
                 "model": model_name,
             }
+            if follow_ups:
+                base_response["follow_ups"] = follow_ups
             emit(
                 "response.created",
                 response={
@@ -481,9 +499,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
             )
             self.wfile.flush()
         else:
-            self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
-                            "model": model_name, "output": output,
-                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}})
+            payload = {"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
+                       "model": model_name, "output": output,
+                       "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}}
+            if follow_ups:
+                payload["follow_ups"] = follow_ups
+            self.send_json(payload)
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 
@@ -518,12 +539,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 self._start_sse()
                 full_text = ""
+                follow_filter = FollowUpStreamFilter()
                 for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
-                    if not delta:
+                    piece = follow_filter.feed(delta)
+                    if not piece:
                         continue
-                    full_text += delta
+                    full_text += piece
                     chunk_obj = {
-                        "candidates": [{"content": {"parts": [{"text": delta}], "role": "model"}, "index": 0}],
+                        "candidates": [{"content": {"parts": [{"text": piece}], "role": "model"}, "index": 0}],
+                        "modelVersion": model_name,
+                    }
+                    self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                tail, _follow_ups = follow_filter.flush()
+                if tail:
+                    full_text += tail
+                    chunk_obj = {
+                        "candidates": [{"content": {"parts": [{"text": tail}], "role": "model"}, "index": 0}],
                         "modelVersion": model_name,
                     }
                     self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
@@ -554,6 +586,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if not text:
             log("Warning: empty response from Gemini")
 
+        text, _follow_ups = parse_follow_ups(text)
         response_parts = []
         if has_tools and text:
             clean_text, function_calls = parse_google_function_calls(text)

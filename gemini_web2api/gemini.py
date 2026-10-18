@@ -166,6 +166,101 @@ def clean_text(text: str, strip: bool = True) -> str:
     return text.strip() if strip else text
 
 
+_FOLLOW_UP_OPEN = "<FollowUp"
+_FOLLOW_UP_PAIRED_RE = re.compile(r'<FollowUp\b([^>]*)>(.*?)</FollowUp>', re.DOTALL)
+# Gemini emits the widget in both shapes: <FollowUp .../> and <FollowUp ...>text</FollowUp>
+_FOLLOW_UP_SELF_RE = re.compile(r'<FollowUp\b([^>]*?)/>', re.DOTALL)
+_FOLLOW_UP_ATTR_RE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
+
+
+def parse_follow_ups(text: str) -> tuple:
+    """Split Gemini's suggested-question widget out of a response body.
+
+    Gemini Web appends a UI widget to the answer, in either shape:
+
+        <FollowUp label="Why is the sky blue?" query="why is the sky blue"/>
+        <FollowUp label="...">visible text</FollowUp>
+
+    It is a recommendation for the *next* turn, not part of the answer, so
+    callers usually want it removed from the text and surfaced separately.
+    Returns ``(text_without_widgets, suggestions)`` where each suggestion is
+    ``{"label", "query", "text"}``; ``query`` is the string to send as the
+    next user message.
+    """
+    if not text or _FOLLOW_UP_OPEN not in text:
+        return text, []
+
+    suggestions = []
+
+    def add(attrs, body):
+        fields = dict(_FOLLOW_UP_ATTR_RE.findall(attrs))
+        visible = (body or "").strip()
+        query = (fields.get("query") or visible or "").strip()
+        if not query:
+            return
+        suggestions.append({
+            "label": (fields.get("label") or visible or query).strip(),
+            "query": query,
+            "text": visible,
+        })
+
+    for attrs in _FOLLOW_UP_SELF_RE.findall(text):
+        add(attrs, "")
+    text = _FOLLOW_UP_SELF_RE.sub("", text)
+    for attrs, body in _FOLLOW_UP_PAIRED_RE.findall(text):
+        add(attrs, body)
+    text = _FOLLOW_UP_PAIRED_RE.sub("", text)
+    return text.strip(), suggestions
+
+
+class FollowUpStreamFilter:
+    """Streaming counterpart of :func:`parse_follow_ups`.
+
+    The widget can arrive split across many deltas, so text that might be the
+    start of a ``<FollowUp`` tag is held back until it is resolved; anything
+    held is released by :meth:`flush` when the upstream stream ends.
+    """
+
+    _OPEN = _FOLLOW_UP_OPEN
+
+    def __init__(self):
+        self._pending = ""
+        self._terminal = False
+
+    def feed(self, delta: str) -> str:
+        """Return the part of ``delta`` safe to emit now."""
+        if not delta:
+            return ""
+        self._pending += delta
+        if self._terminal:
+            return ""
+        index = self._pending.find(self._OPEN)
+        if index != -1:
+            # The widget runs to the end of the response; hold everything after it.
+            self._terminal = True
+            ready, self._pending = self._pending[:index], self._pending[index:]
+        else:
+            hold = 0
+            for size in range(len(self._OPEN) - 1, 0, -1):
+                if self._pending.endswith(self._OPEN[:size]):
+                    hold = size
+                    break
+            cut = len(self._pending) - hold
+            ready, self._pending = self._pending[:cut], self._pending[cut:]
+        # Whitespace before the widget would otherwise be emitted and then be
+        # unstrippable, so keep trailing whitespace pending until it resolves.
+        trimmed = ready.rstrip()
+        if len(trimmed) != len(ready):
+            self._pending = ready[len(trimmed):] + self._pending
+        return trimmed
+
+    def flush(self) -> tuple:
+        """Return ``(trailing_text, suggestions)`` once the stream is done."""
+        rest, self._pending = self._pending, ""
+        return parse_follow_ups(rest)
+
+
+
 def _extract_texts_from_line(line: str) -> list:
     """Parse a single wrb.fr line and return list of text strings found."""
     if '"wrb.fr"' not in line or len(line) < 200:
