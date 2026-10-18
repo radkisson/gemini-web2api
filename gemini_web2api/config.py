@@ -17,6 +17,11 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    # Model routing. See models.py: mode/think alone does not pick the served
+    # model; the X-Goog-Ext-525001261-Jspb ticket header does. Google rotates
+    # tickets, so override them here when a tier starts returning the fallback.
+    "send_model_ticket": True,
+    "model_tickets": {},
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
