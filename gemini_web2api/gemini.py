@@ -85,7 +85,7 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-def _build_headers() -> dict:
+def _build_headers(extra_fields: dict = None) -> dict:
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -101,7 +101,30 @@ def _build_headers() -> dict:
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    if extra_fields and extra_fields.get("_ticket") and CONFIG.get("send_model_ticket", True):
+        headers["X-Goog-Ext-525001261-Jspb"] = extra_fields["_ticket"]
     return headers
+
+
+def _strip_ticket(extra_fields: dict) -> dict:
+    """Drop the model ticket so the request falls back to the account default."""
+    if not extra_fields:
+        return extra_fields
+    return {k: v for k, v in extra_fields.items() if k != "_ticket"}
+
+
+# Upstream answers a rejected ticket with a short friendly error instead of an
+# HTTP failure, e.g. "I seem to be encountering an error. Can you try again?".
+_CANNED_ERROR_RE = re.compile(
+    r"(I seem to be encountering an error"
+    r"|Something went wrong"
+    r"|I'?m (?:unable|not able) to help with that"
+    r"|Please try again later)", re.I)
+
+
+def _is_canned_error(text: str) -> bool:
+    """True when a short answer looks like upstream's canned rejection text."""
+    return bool(text) and len(text) < 400 and bool(_CANNED_ERROR_RE.search(text))
 
 
 def _apply_chat_persistence_flags(inner: list) -> None:
@@ -139,6 +162,10 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[79] = model_id
     if extra_fields:
         for k, v in extra_fields.items():
+            # Keys prefixed with "_" are request metadata (e.g. the model
+            # ticket, which travels as a header), not payload slot indexes.
+            if isinstance(k, str) and k.startswith("_"):
+                continue
             inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
@@ -301,12 +328,12 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     """Non-streaming generation with retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
-    headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
+        headers = _build_headers(extra_fields)
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
@@ -318,9 +345,17 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
+            text = extract_response_text(raw)
+            if extra_fields and extra_fields.get("_ticket") and _is_canned_error(text):
+                extra_fields = _strip_ticket(extra_fields)
+                log("Model ticket returned a canned error; retrying without X-Goog-Ext-525001261-Jspb")
+                continue
+            return text
         except Exception as e:
             last_err = e
+            if extra_fields and extra_fields.get("_ticket"):
+                extra_fields = _strip_ticket(extra_fields)
+                log("Model ticket rejected or timed out; retrying without X-Goog-Ext-525001261-Jspb")
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
@@ -337,12 +372,12 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
-    headers = _build_headers()
     client = _get_httpx_client()
 
     last_err = None
     emitted_raw_text = ""
     for attempt in range(CONFIG["retry_attempts"]):
+        headers = _build_headers(extra_fields)
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
@@ -358,6 +393,9 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
+                            if (not emitted_raw_text and extra_fields
+                                    and extra_fields.get("_ticket") and _is_canned_error(t)):
+                                raise RuntimeError("model ticket returned a canned error")
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
                             if not t.startswith(emitted_raw_text):
@@ -369,6 +407,9 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             return
         except Exception as e:
             last_err = e
+            if extra_fields and extra_fields.get("_ticket") and not emitted_raw_text:
+                extra_fields = _strip_ticket(extra_fields)
+                log("Model ticket rejected or timed out; retrying without X-Goog-Ext-525001261-Jspb")
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
